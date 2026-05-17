@@ -173,7 +173,13 @@ function New-PivotShortcut($linkPath, $description) {
     $lnk.TargetPath       = "$env:WINDIR\System32\wscript.exe"
     $lnk.Arguments        = '"' + (Join-Path $targetDir 'bin\pivot-tray.vbs') + '"'
     $lnk.WorkingDirectory = $targetDir
-    $lnk.IconLocation     = (Join-Path $targetDir 'assets\icon-128.png')
+    # Windows shortcuts require .ico (PNG silently falls back to a blank-doc icon).
+    $icoPath = Join-Path $targetDir 'assets\pivot.ico'
+    if (Test-Path $icoPath) {
+        $lnk.IconLocation = "$icoPath,0"
+    } else {
+        $lnk.IconLocation = (Join-Path $targetDir 'assets\icon-128.png')
+    }
     $lnk.Description      = $description
     $lnk.WindowStyle      = 7  # Minimized; wscript itself is windowless so this is just a hint.
     $lnk.Save()
