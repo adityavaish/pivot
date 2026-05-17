@@ -823,7 +823,11 @@ async function loadMcpServers() {
     const raw = localStorage.getItem("pivot_mcp_servers");
     if (!raw) return;
     const servers = JSON.parse(raw);
-    for (const [id, cfg] of Object.entries(servers)) {
+    // Connect every previously-imported server in parallel. Server unavailable
+    // at startup is ignored silently — the row simply won't appear until the
+    // user retries.
+    const entries = Object.entries(servers);
+    await Promise.allSettled(entries.map(async ([id, cfg]) => {
       try {
         if (cfg.transport === "stdio") {
           const args = cfg.args ? cfg.args.split(/\s+/) : [];
@@ -835,10 +839,11 @@ async function loadMcpServers() {
           const apiKey = sessionStorage.getItem(`pivot_mcp_key_${id}`) || undefined;
           await mcpClient.connect(id, cfg.url, { apiKey, transport: cfg.transport || "auto" });
         }
+        renderMcpServerList();
       } catch {
-        // Server unavailable at startup — ignore silently
+        // Server unavailable — ignore silently
       }
-    }
+    }));
   } catch { /* ignore */ }
 }
 
@@ -847,71 +852,100 @@ async function importLocalMcpServers() {
   const label = proxyBaseUrl ? proxyBaseUrl : "this Pivot server";
   setMcpImportStatus(`Scanning local MCP configs via ${label}…`);
 
+  let payload;
   try {
     const res = await fetch(`${proxyBaseUrl}/api/mcp-config/discover`);
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}`);
     }
-
-    const payload = await res.json();
-    const servers = Array.isArray(payload.servers) ? payload.servers : [];
-    if (servers.length === 0) {
-      setMcpImportStatus(
-        "No MCP server configs were found. Looked for VS Code, GitHub Copilot CLI, Claude (Desktop/Code), Cursor, Windsurf, Continue, Roo, Cline and Zed config files. " +
-        "Add servers in those clients (or set PIVOT_MCP_CONFIGS) and retry."
-      );
-      return;
-    }
-
-    let imported = 0;
-    let skipped = 0;
-
-    for (const server of servers) {
-      try {
-        if (server.transport === "stdio") {
-          const session = await mcpClient.connectStdio(server.id, server.command, server.args || [], {
-            cwd: server.cwd || undefined,
-            env: server.env || {},
-            proxyBaseUrl,
-          });
-          saveMcpServerConfig(server.id, {
-            transport: "stdio",
-            command: server.command,
-            args: Array.isArray(server.args) ? server.args.join(" ") : "",
-            cwd: server.cwd || "",
-            proxyBaseUrl,
-            importedFrom: server.sourcePath || server.source || "",
-          });
-          imported += session ? 1 : 0;
-        } else if (server.url) {
-          const session = await mcpClient.connect(server.id, server.url, { transport: server.transport || "auto" });
-          saveMcpServerConfig(server.id, {
-            url: server.url,
-            transport: server.transport || "auto",
-            importedFrom: server.sourcePath || server.source || "",
-          });
-          imported += session ? 1 : 0;
-        }
-      } catch {
-        skipped++;
-      }
-    }
-
-    renderMcpServerList();
-    const detail = skipped > 0 ? ` (${skipped} skipped — check the server's command is on PATH)` : "";
-    setMcpImportStatus(
-      imported > 0
-        ? `Imported ${imported} MCP server${imported === 1 ? "" : "s"}${detail}.`
-        : `Found ${servers.length} server${servers.length === 1 ? "" : "s"} but none could be connected${detail}.`,
-      imported === 0,
-    );
+    payload = await res.json();
   } catch (err) {
     setMcpImportStatus(
       `Could not reach the MCP discovery endpoint at ${label}. ` +
       `Make sure the Pivot local server is running (run \`pivot\`). ${err.message}`,
       true,
     );
+    return;
   }
+
+  const servers = Array.isArray(payload.servers) ? payload.servers : [];
+  if (servers.length === 0) {
+    setMcpImportStatus(
+      "No MCP server configs were found. Looked for VS Code, GitHub Copilot CLI, Claude (Desktop/Code), Cursor, Windsurf, Continue, Roo, Cline and Zed config files. " +
+      "Add servers in those clients (or set PIVOT_MCP_CONFIGS) and retry."
+    );
+    return;
+  }
+
+  // Persist all discovered configs up-front so even servers that take a long
+  // time (or fail) to start are remembered for next launch. Discovery is the
+  // expensive part the user is waiting for; the spawn/handshake happens in
+  // the background and the list updates as each server connects.
+  for (const server of servers) {
+    if (server.transport === "stdio") {
+      saveMcpServerConfig(server.id, {
+        transport: "stdio",
+        command: server.command,
+        args: Array.isArray(server.args) ? server.args.join(" ") : "",
+        cwd: server.cwd || "",
+        proxyBaseUrl,
+        importedFrom: server.sourcePath || server.source || "",
+      });
+    } else if (server.url) {
+      saveMcpServerConfig(server.id, {
+        url: server.url,
+        transport: server.transport || "auto",
+        importedFrom: server.sourcePath || server.source || "",
+      });
+    }
+  }
+
+  setMcpImportStatus(`Imported ${servers.length} MCP config${servers.length === 1 ? "" : "s"}. Connecting in the background…`);
+
+  let imported = 0;
+  let skipped = 0;
+  let settled = 0;
+  const total = servers.length;
+
+  const updateProgress = () => {
+    if (settled === total) {
+      const detail = skipped > 0 ? ` (${skipped} skipped — check the server's command is on PATH)` : "";
+      setMcpImportStatus(
+        imported > 0
+          ? `Connected ${imported} of ${total} MCP server${total === 1 ? "" : "s"}${detail}.`
+          : `Found ${total} server${total === 1 ? "" : "s"} but none could be connected${detail}.`,
+        imported === 0,
+      );
+    } else {
+      setMcpImportStatus(`Connecting ${settled + 1}/${total}… (${imported} ready)`);
+    }
+  };
+
+  await Promise.allSettled(servers.map(async (server) => {
+    try {
+      let session;
+      if (server.transport === "stdio") {
+        session = await mcpClient.connectStdio(server.id, server.command, server.args || [], {
+          cwd: server.cwd || undefined,
+          env: server.env || {},
+          proxyBaseUrl,
+        });
+      } else if (server.url) {
+        session = await mcpClient.connect(server.id, server.url, { transport: server.transport || "auto" });
+      }
+      if (session) {
+        imported++;
+      } else {
+        skipped++;
+      }
+    } catch {
+      skipped++;
+    } finally {
+      settled++;
+      renderMcpServerList();
+      updateProgress();
+    }
+  }));
 }
 
 // ── Settings Panel ──────────────────────────────────────────────────────
